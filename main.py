@@ -19,7 +19,7 @@ bot = telebot.TeleBot(API_TOKEN)
 
 # منطقه زمانی تهران
 tehran_tz = pytz.timezone('Asia/Tehran')
-
+DB_PATH = '/app/data/sweep_bot.db' if os.path.exists('/app/data') else 'sweep_bot.db'
 # دیتابیس
 def init_db():
     conn = sqlite3.connect('sweep_bot.db', check_same_thread=False)
