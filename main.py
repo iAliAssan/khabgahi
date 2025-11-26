@@ -3,26 +3,39 @@ from telebot import types
 import sqlite3
 from datetime import datetime, timedelta
 import pytz
+from apscheduler.schedulers.background import BackgroundScheduler
+import os
+import logging
+
+# تنظیم logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # ایمپورت توکن از فایل config
 try:
     from config import API_TOKEN, SUPPORT_USERNAME
 except ImportError:
-    print("❌ فایل config.py یافت نشد!")
+    logger.error("❌ فایل config.py یافت نشد!")
     exit(1)
 
 if not API_TOKEN or API_TOKEN == "YOUR_BOT_TOKEN_HERE":
-    print("❌ توکن ربات تنظیم نشده!")
+    logger.error("❌ توکن ربات تنظیم نشده!")
     exit(1)
 
 bot = telebot.TeleBot(API_TOKEN)
 
 # منطقه زمانی تهران
 tehran_tz = pytz.timezone('Asia/Tehran')
+
+# مسیر دیتابیس - استفاده از volume برای persistence
 DB_PATH = '/app/data/sweep_bot.db' if os.path.exists('/app/data') else 'sweep_bot.db'
+
 # دیتابیس
 def init_db():
-    conn = sqlite3.connect('sweep_bot.db', check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS activities
                  (id INTEGER PRIMARY KEY, chat_id INTEGER, name TEXT, created_date TEXT, interval_hours INTEGER)''')
@@ -30,8 +43,81 @@ def init_db():
                  (id INTEGER PRIMARY KEY, activity_id INTEGER, name TEXT, username TEXT, turn_date TEXT, score INTEGER DEFAULT 0)''')
     conn.commit()
     conn.close()
+    logger.info("✅ دیتابیس initialized شد")
 
 init_db()
+
+# زمان‌بند برای چک کردن نوبت‌ها
+scheduler = BackgroundScheduler(timezone=tehran_tz)
+
+def check_and_announce_due_turns():
+    """چک کردن و اعلام نوبت‌های رسیده"""
+    try:
+        logger.info("🔍 در حال چک کردن نوبت‌های رسیده...")
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        
+        # زمان فعلی تهران
+        now_tehran = get_tehran_time().strftime("%Y-%m-%d %H:%M")
+        
+        # پیدا کردن تمام فعالیت‌ها
+        c.execute("SELECT id, chat_id, name FROM activities")
+        activities = c.fetchall()
+        
+        announced_count = 0
+        for activity_id, chat_id, activity_name in activities:
+            # پیدا کردن نوبت فعلی که زمانش رسیده
+            c.execute("""
+                SELECT name, username, turn_date 
+                FROM turns 
+                WHERE activity_id = ? AND turn_date <= ? 
+                ORDER BY turn_date 
+                LIMIT 1
+            """, (activity_id, now_tehran))
+            
+            due_turn = c.fetchone()
+            
+            if due_turn:
+                name, username, turn_date = due_turn
+                
+                # بررسی اینکه آیا این نوبت در 10 دقیقه گذشته اعلام شده یا نه
+                turn_datetime = datetime.strptime(turn_date, "%Y-%m-%d %H:%M")
+                now_datetime = datetime.strptime(now_tehran, "%Y-%m-%d %H:%M")
+                
+                # اگر نوبت در 10 دقیقه گذشته بوده
+                if (now_datetime - turn_datetime).total_seconds() <= 600:
+                    text = f"🎯 نوبت {activity_name} رسیده!\n\n"
+                    text += f"👤 مسئول امروز: {name} {username}\n"
+                    text += f"⏰ تاریخ نوبت: {turn_date}\n\n"
+                    text += "پس از انجام کار، امتیاز بدین! ⭐"
+                    
+                    try:
+                        bot.send_message(chat_id, text, reply_markup=score_buttons(activity_id))
+                        announced_count += 1
+                        logger.info(f"✅ نوبت اعلام شد برای {activity_name} در چت {chat_id}")
+                    except Exception as e:
+                        logger.error(f"❌ خطا در ارسال پیام نوبت: {e}")
+        
+        conn.close()
+        if announced_count > 0:
+            logger.info(f"🎉 {announced_count} نوبت جدید اعلام شد")
+        else:
+            logger.info("✅ هیچ نوبت جدیدی برای اعلام نبود")
+            
+    except Exception as e:
+        logger.error(f"❌ خطا در چک کردن نوبت‌ها: {e}")
+
+# زمان‌بندی چک کردن هر 1 دقیقه
+scheduler.add_job(
+    check_and_announce_due_turns,
+    'interval',
+    minutes=1,
+    id='check_due_turns'
+)
+
+# شروع scheduler
+scheduler.start()
+logger.info("✅ APScheduler شروع به کار کرد")
 
 # ================================
 # بخش خصوصی (Private Chat)
@@ -138,7 +224,7 @@ def is_admin(chat_id, user_id):
         member = bot.get_chat_member(chat_id, user_id)
         return member.status in ['administrator', 'creator']
     except Exception as e:
-        print(f"خطا در بررسی ادمین: {e}")
+        logger.error(f"خطا در بررسی ادمین: {e}")
         return False
 
 # دکمه‌های شیشه‌ای منوی اصلی در گروه
@@ -515,7 +601,7 @@ def process_user_list(message, original_message_id, user_id, activity_name):
             )
 
     except Exception as e:
-        print(f"خطا در پردازش لیست: {e}")
+        logger.error(f"خطا در پردازش لیست: {e}")
         text = "❌ یه مشکلی پیش اومد!\n\nبیا از اول شروع کنیم؟ 🫠"
         bot.edit_message_text(
             text,
@@ -669,7 +755,7 @@ def process_interval(message, original_message_id, user_id):
             reply_markup=group_main_menu(message.chat.id, user_id)
         )
     except Exception as e:
-        print(f"خطا در پردازش فاصله: {e}")
+        logger.error(f"خطا در پردازش فاصله: {e}")
         text = "❌ یه مشکلی پیش اومد!\n\nبیا از اول شروع کنیم؟ 🫠"
         bot.edit_message_text(
             text,
@@ -680,7 +766,7 @@ def process_interval(message, original_message_id, user_id):
 
 # تابع جدید برای ذخیره کاربران با فرمت جدید
 def save_users_new(turns, interval_hours, activity_id):
-    conn = sqlite3.connect('sweep_bot.db')
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
 
     # حذف نوبت‌های قبلی این فعالیت
@@ -768,7 +854,7 @@ def confirm_delete_activity(chat_id, message_id, user_id, activity_id):
 def delete_activity(chat_id, message_id, user_id, activity_id):
     activity_name = get_activity_name(activity_id)
 
-    conn = sqlite3.connect('sweep_bot.db')
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("DELETE FROM activities WHERE id = ?", (activity_id,))
     c.execute("DELETE FROM turns WHERE activity_id = ?", (activity_id,))
@@ -918,7 +1004,7 @@ def handle_score(call, chat_id, message_id, user_id):
 # ================================
 
 def save_activity(chat_id, activity_name, interval_hours):
-    conn = sqlite3.connect('sweep_bot.db')
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     now = get_tehran_time().strftime("%Y-%m-%d %H:%M")
     c.execute("INSERT INTO activities (chat_id, name, created_date, interval_hours) VALUES (?, ?, ?, ?)",
@@ -929,7 +1015,7 @@ def save_activity(chat_id, activity_name, interval_hours):
     return activity_id
 
 def save_users(users, interval_hours, activity_id):
-    conn = sqlite3.connect('sweep_bot.db')
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
 
     # حذف نوبت‌های قبلی این فعالیت
@@ -945,7 +1031,7 @@ def save_users(users, interval_hours, activity_id):
     conn.close()
 
 def update_turn_intervals(activity_id, interval_hours):
-    conn = sqlite3.connect('sweep_bot.db')
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
 
     # گرفتن لیست کاربران این فعالیت
@@ -966,7 +1052,7 @@ def update_turn_intervals(activity_id, interval_hours):
     conn.close()
 
 def get_activity_name(activity_id):
-    conn = sqlite3.connect('sweep_bot.db')
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT name FROM activities WHERE id = ?", (activity_id,))
     result = c.fetchone()
@@ -977,7 +1063,7 @@ def get_activity_name(activity_id):
     return "فعالیت"
 
 def get_activity_interval(activity_id):
-    conn = sqlite3.connect('sweep_bot.db')
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT interval_hours FROM activities WHERE id = ?", (activity_id,))
     result = c.fetchone()
@@ -988,7 +1074,7 @@ def get_activity_interval(activity_id):
     return 1  # پیش‌فرض 1 ساعت
 
 def get_all_activities(chat_id):
-    conn = sqlite3.connect('sweep_bot.db')
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT id, name FROM activities WHERE chat_id = ? ORDER BY created_date", (chat_id,))
     results = c.fetchall()
@@ -997,7 +1083,7 @@ def get_all_activities(chat_id):
     return [{'id': result[0], 'name': result[1]} for result in results]
 
 def get_current_turn(activity_id):
-    conn = sqlite3.connect('sweep_bot.db')
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
 
     # استفاده از زمان تهران برای مقایسه
@@ -1012,7 +1098,7 @@ def get_current_turn(activity_id):
     return None
 
 def get_next_turns(limit, activity_id):
-    conn = sqlite3.connect('sweep_bot.db')
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT name, username, turn_date FROM turns WHERE activity_id = ? ORDER BY turn_date LIMIT ?",
              (activity_id, limit))
@@ -1022,7 +1108,7 @@ def get_next_turns(limit, activity_id):
     return [{'name': result[0], 'username': result[1], 'turn_date': result[2]} for result in results]
 
 def move_to_next_turn(current_user_name, activity_id):
-    conn = sqlite3.connect('sweep_bot.db')
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
 
     # پیدا کردن فاصله نوبت‌ها از جدول activities
@@ -1050,7 +1136,7 @@ def move_to_next_turn(current_user_name, activity_id):
     conn.close()
 
 def get_scores(activity_id):
-    conn = sqlite3.connect('sweep_bot.db')
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT name, score FROM turns WHERE activity_id = ? ORDER BY score DESC", (activity_id,))
     results = c.fetchall()
@@ -1059,8 +1145,34 @@ def get_scores(activity_id):
     return [{'name': r[0], 'score': r[1]} for r in results]
 
 def update_score(name, score, activity_id):
-    conn = sqlite3.connect('sweep_bot.db')
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("UPDATE turns SET score = score + ? WHERE activity_id = ? AND name = ?", (score, activity_id, name))
     conn.commit()
     conn.close()
+
+def main():
+    """تابع اصلی برای اجرای ربات"""
+    try:
+        logger.info("🚀 شروع ربات مدیریت نوبت‌های گروه...")
+        print("=" * 50)
+        print("🤖 ربات مدیریت نوبت‌های گروه")
+        print("📍 منطقه زمانی: تهران")
+        print("⏰ سرویس زمان‌بندی: فعال")
+        print("💾 مسیر دیتابیس: " + DB_PATH)
+        print("=" * 50)
+        
+        # چک کردن اتصال
+        bot_info = bot.get_me()
+        logger.info(f"✅ ربات با موفقیت متصل شد: @{bot_info.username}")
+        
+        # شروع polling
+        logger.info("🔄 شروع polling...")
+        bot.infinity_polling()
+        
+    except Exception as e:
+        logger.error(f"❌ خطای اصلی: {e}")
+        scheduler.shutdown()
+
+if __name__ == "__main__":
+    main()
